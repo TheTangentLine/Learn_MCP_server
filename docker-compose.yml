@@ -1,0 +1,8 @@
+services:
+  mcp-server:
+    build: .
+    volumes:
+      - ./repositories:/app/repositories
+      - ./vector_db:/app/vector_db
+    stdin_open: true
+    tty: true

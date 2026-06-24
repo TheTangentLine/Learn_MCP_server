@@ -11,24 +11,11 @@
 Your host machine manages the initial git synchronization. Keeping repositories outside the Docker image means the image stays lightweight and fast to rebuild — code lives in a shared bind volume, not inside immutable image layers.
 
 ```makefile
-.PHONY: clone-repos build run clean
+.PHONY: clone-repos build run
 
 clone-repos:
-	@echo "Fetching repo list and cloning repositories..."
-	python3 -c " \
-	import urllib.request, json, os, subprocess; \
-	url = 'https://raw.githubusercontent.com/TheTangentLine/learn/main/data/repos.json'; \
-	repos = json.loads(urllib.request.urlopen(url).read().decode()); \
-	os.makedirs('repositories', exist_ok=True); \
-	for r in repos.get('repos', []): \
-	    name = r.split('/')[-1].replace('.git', ''); \
-	    path = os.path.join('repositories', name); \
-	    if not os.path.exists(path): \
-	        print(f'Cloning {r}...'); \
-	        subprocess.run(['git', 'clone', r, path]); \
-	    else: \
-	        print(f'{name} already exists. Skipping.'); \
-	"
+	@echo "Cloning repositories..."
+	python3 src/cloner.py
 
 build:
 	docker compose build
@@ -45,44 +32,70 @@ run: clone-repos build
 
 **Chunking strategy:**
 
-- **By file extension:** Only source files are indexed (`.py`, `.go`, `.java`, `.cpp`). Binary files, images, and lockfiles (`package-lock.json`, `go.sum`) are excluded.
-- **Current implementation:** Each file is stored as a single document, keyed by its relative path. Function/class-level chunking is a planned improvement that would increase retrieval precision for large files.
+- **By file extension:** Only source files are indexed (`.py`, `.go`, `.java`, `.cpp`, `.js`, `.ts`). Binary files, images, and lockfiles (`package-lock.json`, `go.sum`) are excluded.
+- **Current implementation:** Each file is stored as a single document, keyed by its relative path. Metadata includes `source` (relative path), `filename`, and `repo` (top-level directory name). Function/class-level chunking is a planned improvement that would increase retrieval precision for large files.
 
 ```python
 import os
+
 import chromadb
 from chromadb.utils import embedding_functions
 
-def initialize_rag():
-    client = chromadb.PersistentClient(path="/app/vector_db")
+REPOS_DIR = "/app/repositories"
+VECTOR_DB_DIR = "/app/vector_db"
+COLLECTION_NAME = "repo_codebase"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+SOURCE_EXTENSIONS = {".py", ".go", ".java", ".cpp", ".js", ".ts"}
+
+
+def initialize_rag() -> chromadb.Collection:
+    client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
 
     emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
+        model_name=EMBEDDING_MODEL
     )
 
     collection = client.get_or_create_collection(
-        name="repo_codebase",
-        embedding_function=emb_fn
+        name=COLLECTION_NAME,
+        embedding_function=emb_fn,
     )
 
-    repo_dir = "/app/repositories"
-    if not os.path.exists(repo_dir):
+    if not os.path.exists(REPOS_DIR):
+        print(f"[indexer] repositories dir not found at {REPOS_DIR}, skipping indexing.")
         return collection
 
-    for root, _, files in os.walk(repo_dir):
-        for file in files:
-            if file.endswith(('.py', '.go', '.java', '.cpp')):
-                file_path = os.path.join(root, file)
-                with open(file_path, 'r', errors='ignore') as f:
-                    content = f.read()
+    indexed = 0
+    for root, _, files in os.walk(REPOS_DIR):
+        for filename in files:
+            if os.path.splitext(filename)[1] not in SOURCE_EXTENSIONS:
+                continue
 
-                if content.strip():
-                    doc_id = os.path.relpath(file_path, repo_dir)
-                    collection.upsert(
-                        documents=[content],
-                        metadatas=[{"source": doc_id, "filename": file}],
-                        ids=[doc_id]
-                    )
+            file_path = os.path.join(root, filename)
+            try:
+                with open(file_path, "r", errors="ignore") as f:
+                    content = f.read()
+            except OSError:
+                continue
+
+            if not content.strip():
+                continue
+
+            rel_path = os.path.relpath(file_path, REPOS_DIR)
+            repo_name = rel_path.split(os.sep)[0]
+
+            collection.upsert(
+                documents=[content],
+                metadatas=[{
+                    "source": rel_path,
+                    "filename": filename,
+                    "repo": repo_name,
+                }],
+                ids=[rel_path],
+            )
+            indexed += 1
+
+    print(f"[indexer] Indexed {indexed} files into ChromaDB.")
     return collection
 ```
 
@@ -99,12 +112,15 @@ Uses the official Anthropic `mcp` Python SDK via `FastMCP`. When hosted in Docke
 
 ```python
 import os
+
 from mcp.server.fastmcp import FastMCP
+
 from indexer import initialize_rag
 
 mcp = FastMCP("Mock Interview RAG Server")
 
 collection = initialize_rag()
+
 
 @mcp.tool()
 def search_codebase(query: str, n_results: int = 3) -> str:
@@ -114,14 +130,15 @@ def search_codebase(query: str, n_results: int = 3) -> str:
     """
     results = collection.query(
         query_texts=[query],
-        n_results=n_results
+        n_results=n_results,
     )
 
-    formatted_results = []
-    for doc, meta in zip(results['documents'][0], results['metadatas'][0]):
-        formatted_results.append(f"--- File: {meta['source']} ---\n{doc}\n")
+    formatted = []
+    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+        formatted.append(f"--- File: {meta['source']} ---\n{doc}\n")
 
-    return "\n".join(formatted_results)
+    return "\n".join(formatted) if formatted else "No results found."
+
 
 @mcp.tool()
 def list_available_repositories() -> list[str]:
@@ -130,6 +147,7 @@ def list_available_repositories() -> list[str]:
         return os.listdir("/app/repositories")
     except FileNotFoundError:
         return []
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
