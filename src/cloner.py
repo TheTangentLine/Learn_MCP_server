@@ -12,6 +12,7 @@ REPOS_DIR = os.path.join(os.path.dirname(__file__), "..", "repositories")
 def fetch_repos() -> list[Repo]:
     with urllib.request.urlopen(REPOS_URL) as response:
         data = json.loads(response.read().decode())
+    entries = data if isinstance(data, list) else data.get("repos", [])
     return [
         Repo(
             slug=entry["slug"],
@@ -19,7 +20,7 @@ def fetch_repos() -> list[Repo]:
             category=entry["category"],
             username=entry["username"],
         )
-        for entry in data.get("repos", [])
+        for entry in entries
     ]
 
 
