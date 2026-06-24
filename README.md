@@ -34,11 +34,11 @@ flowchart TD
     Claude <-->|"stdio"| server
 ```
 
-| Phase | Component | Responsibility |
-| ----- | --------- | -------------- |
-| **1. Ingestion** | `Makefile` | Fetches `repos.json` from GitHub and clones each repository to `repositories/` |
+| Phase            | Component    | Responsibility                                                                                      |
+| ---------------- | ------------ | --------------------------------------------------------------------------------------------------- |
+| **1. Ingestion** | `Makefile`   | Fetches `repos.json` from GitHub and clones each repository to `repositories/`                      |
 | **2. Embedding** | `indexer.py` | Walks the mounted `repositories/` directory, chunks source files, and stores embeddings in ChromaDB |
-| **3. Protocol** | `server.py` | Exposes `search_codebase` and `list_available_repositories` tools to any MCP-compatible client |
+| **3. Protocol**  | `server.py`  | Exposes `search_codebase` and `list_available_repositories` tools to any MCP-compatible client      |
 
 ---
 
@@ -99,7 +99,14 @@ Once the container is running, register it in your MCP client's configuration fi
   "mcpServers": {
     "mock-interview": {
       "command": "docker",
-      "args": ["compose", "-f", "/path/to/mcp-mock-interview/docker-compose.yml", "run", "--rm", "mcp-server"]
+      "args": [
+        "compose",
+        "-f",
+        "/path/to/mcp-mock-interview/docker-compose.yml",
+        "run",
+        "--rm",
+        "mcp-server"
+      ]
     }
   }
 }
@@ -112,7 +119,14 @@ Once the container is running, register it in your MCP client's configuration fi
   "mcpServers": {
     "mock-interview": {
       "command": "docker",
-      "args": ["compose", "-f", "/path/to/mcp-mock-interview/docker-compose.yml", "run", "--rm", "mcp-server"]
+      "args": [
+        "compose",
+        "-f",
+        "/path/to/mcp-mock-interview/docker-compose.yml",
+        "run",
+        "--rm",
+        "mcp-server"
+      ]
     }
   }
 }
@@ -122,4 +136,4 @@ Restart your client after saving the config to load the new server.
 
 ---
 
-For implementation details — component code, chunking strategy, and container configuration — see [docs.md](docs.md).
+For implementation details — component code, chunking strategy, and container configuration — see [docs.md](docs/docs.md).
