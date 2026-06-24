@@ -1,4 +1,4 @@
-.PHONY: clone-repos build run logs
+.PHONY: clone-repos build run logs down
 
 clone-repos:
 	@echo "Cloning repositories..."
@@ -12,3 +12,6 @@ run: clone-repos build
 
 logs:
 	docker compose logs -f mcp-server
+
+down:
+	docker compose down
