@@ -34,11 +34,15 @@ flowchart TD
     Claude <-->|"stdio"| server
 ```
 
+
+
+
 | Phase            | Component    | Responsibility                                                                                      |
 | ---------------- | ------------ | --------------------------------------------------------------------------------------------------- |
 | **1. Ingestion** | `Makefile`   | Fetches `repos.json` from GitHub and clones each repository to `repositories/`                      |
 | **2. Embedding** | `indexer.py` | Walks the mounted `repositories/` directory, chunks source files, and stores embeddings in ChromaDB |
 | **3. Protocol**  | `server.py`  | Exposes `search_codebase` and `list_available_repositories` tools to any MCP-compatible client      |
+
 
 ---
 
@@ -75,8 +79,8 @@ mcp-mock-interview/
 
 ```bash
 # 1. Clone this repository
-git clone https://github.com/TheTangentLine/mcp-mock-interview.git
-cd mcp-mock-interview
+git clone https://github.com/TheTangentLine/Learn_MCP_server
+cd Learn_MCP_server
 
 # 2. Clone target repos, build the image, and start the server
 make run
