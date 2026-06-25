@@ -8,7 +8,9 @@
 
 ### MCP (Model Context Protocol)
 
-MCP is a protocol that lets an LLM client (Cursor, Claude Desktop) call typed external tools at runtime. The server declares tools with names, argument schemas, and return types. When the LLM decides it needs information — such as a list of available codebases or a relevant code snippet — it issues a tool call by name with typed arguments. The server executes the call and returns a result that the LLM incorporates into its next response. All communication happens over `stdio`, which is why Docker requires `stdin_open: true` and `tty: true`.
+MCP is a protocol that lets an LLM client (Cursor, Claude Desktop) call typed external tools at runtime. The server declares tools with names, argument schemas, and return types. When the LLM decides it needs information — such as a list of available codebases or a relevant code snippet — it issues a tool call by name with typed arguments. The server executes the call and returns a result that the LLM incorporates into its next response. All communication happens over a transport layer — this project uses `stdio` (local subprocess pipes), but MCP also supports HTTP-based transports for remote deployments. See [MCP Transports](#mcp-transports) for a full comparison.
+
+For the full protocol internals — how the handshake works, how tool schemas are discovered, and the JSON-RPC message format — see [mcp-protocol.md](mcp-protocol.md).
 
 This server exposes two tools:
 
@@ -139,6 +141,74 @@ down:
 | `run`         | Full pipeline: clone → build → start container in detached mode    |
 | `logs`        | Tail live output from the running container (`-f` follows)         |
 | `down`        | Stop the container and remove it                                   |
+
+---
+
+### Startup & Reconnection Guide
+
+There are two distinct ways to run this server. Understanding the difference determines whether you need to run any `make` commands after the first-time setup.
+
+#### Mode 1: Ephemeral per-session (MCP client config — the normal way)
+
+The client config in Cursor or Claude Desktop uses `docker compose run --rm`:
+
+```json
+{
+  "mcpServers": {
+    "mock-interview": {
+      "command": "docker",
+      "args": ["compose", "-f", "/path/to/docker-compose.yml", "run", "--rm", "mcp-server"]
+    }
+  }
+}
+```
+
+This is entirely self-contained. Every time you open a new chat session, the client:
+1. Spawns a fresh container
+2. Waits for `initialize_rag()` to finish indexing
+3. Begins the MCP session
+4. Removes the container when the session ends (`--rm`)
+
+No pre-running container is needed. If the Docker image doesn't exist yet, `docker compose run` builds it automatically.
+
+```mermaid
+sequenceDiagram
+    participant Client as "MCP Client (Cursor)"
+    participant Docker as "Docker"
+    participant Container as "mcp-server container"
+
+    Client->>Docker: docker compose run --rm mcp-server
+    Docker->>Container: start container, run server.py
+    Container->>Container: initialize_rag() — embed all source files
+    Client<-->Container: MCP tool calls over stdio
+    Client->>Docker: session ends (stdin closes)
+    Docker->>Container: container stops and is removed
+```
+
+#### Mode 2: Persistent background container (`make run`)
+
+`make run` calls `docker compose up -d`, which starts a long-running detached container. This is useful when you want to:
+- Inspect live logs with `make logs`
+- Keep the server warm between sessions (avoids the re-indexing delay on each chat open)
+- Debug startup or indexing issues
+
+When using this mode, the client config still works the same way — it creates a *separate* ephemeral container per session alongside the persistent one. If you want the client to attach to the persistent container instead, you would need a different client config (e.g. using `url` with a network transport — see [MCP Transports](#mcp-transports) below).
+
+#### What you actually need to run after first-time setup
+
+| Requirement | Command | Frequency |
+|---|---|---|
+| Populate `repositories/` | `make clone-repos` | Once on setup; re-run to add new repos |
+| Build the Docker image | `make build` (or auto-built on first session) | Once; re-run after changes to `src/` |
+| Start a session | Open a chat in Cursor/Claude | Every session — handled automatically |
+
+You do **not** need `make run` if you are relying on the MCP client config. The client config is fully self-sufficient.
+
+#### Startup time
+
+The first session after `make clone-repos` is slow — `initialize_rag()` must read every source file and compute embeddings for each one. This can take **30–60 seconds** depending on how many repos are indexed.
+
+Subsequent sessions reuse the persisted `vector_db/` bind mount and skip re-embedding unchanged files (upsert by path ID). Cold start on an already-indexed database is typically **2–5 seconds**.
 
 ---
 
@@ -478,3 +548,205 @@ results = collection.query(
 ```
 
 Exposing this as a parameter on `search_codebase` (or as a separate tool) would let the LLM ask more targeted questions when the user specifies a topic.
+
+---
+
+## MCP Transports
+
+MCP separates the *protocol* (how tools are declared, called, and return results) from the *transport* (how bytes flow between client and server). The same `server.py` code can run locally as a subprocess or remotely over HTTP by changing a single argument.
+
+### The three transport options
+
+| Transport | How it works | Best for |
+|---|---|---|
+| `stdio` | Client spawns the server as a subprocess; communicates over stdin/stdout pipes | Local machine — current project |
+| SSE (Server-Sent Events) | Server runs as an HTTP server; client opens a persistent GET stream for events, sends tool calls via POST | Remote server, LAN, cloud — older MCP clients |
+| Streamable HTTP | Single HTTP endpoint handles both directions using chunked transfer encoding | Remote server, LAN, cloud — preferred for new deployments |
+
+---
+
+### `stdio` — local subprocess (this project)
+
+`stdio` is the standard transport for any MCP server that runs on the same machine as the client. The client config specifies a shell command to run; the MCP client executes it as a subprocess and pipes JSON-RPC messages through stdin/stdout.
+
+```json
+{
+  "mcpServers": {
+    "mock-interview": {
+      "command": "docker",
+      "args": ["compose", "-f", "/path/to/docker-compose.yml", "run", "--rm", "mcp-server"]
+    }
+  }
+}
+```
+
+What happens at the transport level:
+1. Cursor runs the `docker compose run` command as a child process
+2. It writes JSON-encoded tool call requests to the process's `stdin`
+3. It reads JSON-encoded tool results from the process's `stdout`
+4. When the session ends, stdin closes, which signals the container to stop
+
+```mermaid
+flowchart LR
+    subgraph localSetup [Local Machine]
+        clientProc["MCP Client\n(Cursor)"]
+        dockerProc["Docker\n(subprocess)"]
+        containerProc["server.py\n(inside container)"]
+        clientProc -->|"stdin: JSON-RPC request"| dockerProc
+        dockerProc -->|"forwards stdin"| containerProc
+        containerProc -->|"stdout: JSON-RPC response"| dockerProc
+        dockerProc -->|"forwards stdout"| clientProc
+    end
+```
+
+**Characteristics of `stdio`:**
+- Zero network configuration — no ports, no firewalls
+- Inherently private — nothing is exposed to the network
+- One server instance per client machine — the container is spawned fresh for each session
+- Requires Docker to be installed and running on the client machine
+
+---
+
+### SSE — remote HTTP server (legacy)
+
+SSE (Server-Sent Events) was the original MCP network transport. The server runs as a persistent HTTP service. The client connects to it over the network instead of spawning a subprocess.
+
+**When to use SSE:**
+- You want to run the server on a remote VM or cloud instance so multiple team members can share it
+- You want to avoid installing Docker on every client machine
+- Your MCP client only supports SSE (older versions of Claude Desktop)
+
+**How the transport works:**
+- Client opens a persistent `GET /sse` connection — the server pushes tool results back as SSE events over this long-lived stream
+- Client sends tool call requests via `POST /messages`
+- Two separate HTTP connections handle the two directions of communication
+
+**Switching this project to SSE:**
+
+In `src/server.py`, change the transport argument:
+
+```python
+# Before (local stdio)
+mcp.run(transport="stdio")
+
+# After (remote SSE)
+mcp.run(transport="sse", host="0.0.0.0", port=8000)
+```
+
+Expose the port in `docker-compose.yml`:
+
+```yaml
+services:
+  mcp-server:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./repositories:/app/repositories
+      - ./vector_db:/app/vector_db
+    # stdin_open and tty are no longer needed for HTTP transports
+```
+
+Update the client config to use a URL instead of a command:
+
+```json
+{
+  "mcpServers": {
+    "mock-interview": {
+      "url": "http://your-server-address:8000/sse"
+    }
+  }
+}
+```
+
+---
+
+### Streamable HTTP — remote HTTP server (modern, preferred)
+
+Streamable HTTP is the newer MCP transport that replaces SSE. It uses a single HTTP endpoint with chunked transfer encoding, handling both directions over one connection. It is more efficient and simpler to proxy behind a reverse proxy like nginx or Caddy.
+
+**Switching this project to Streamable HTTP:**
+
+```python
+mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
+```
+
+The client config uses the same `url` format, pointing at `/mcp` instead of `/sse`:
+
+```json
+{
+  "mcpServers": {
+    "mock-interview": {
+      "url": "http://your-server-address:8000/mcp"
+    }
+  }
+}
+```
+
+The `docker-compose.yml` port exposure is identical to the SSE example above.
+
+---
+
+### Side-by-side comparison
+
+```mermaid
+flowchart TD
+    subgraph stdioMode [stdio — Local]
+        cursorA["Cursor\n(client)"]
+        containerA["server.py\n(Docker, same machine)"]
+        cursorA <-->|"stdin / stdout pipes"| containerA
+    end
+
+    subgraph httpMode [SSE or Streamable HTTP — Remote]
+        cursorB["Cursor\n(client, any machine)"]
+        internet["Network / Internet"]
+        containerB["server.py\n(VM or cloud, port 8000)"]
+        cursorB <-->|"HTTP"| internet
+        internet <-->|"HTTP"| containerB
+    end
+```
+
+| Property | `stdio` | SSE / Streamable HTTP |
+|---|---|---|
+| Server location | Same machine as client | Anywhere with a network address |
+| Client config key | `command` + `args` | `url` |
+| Docker required on client | Yes | No |
+| Shared across machines | No | Yes |
+| Network exposure | None | Port must be open |
+| Auth required | No (OS-level isolation) | Yes (for any non-localhost deployment) |
+| Startup per session | Fresh container each time | Server runs persistently |
+
+---
+
+### Security considerations for remote transports
+
+`stdio` provides security by isolation — the server process is only reachable through the client that spawned it. Remote transports expose an HTTP port, which changes the threat model:
+
+- **Use HTTPS** — run behind a reverse proxy (nginx, Caddy) with a TLS certificate, or use a managed platform that handles TLS
+- **Add authentication** — FastMCP supports auth middleware. At minimum, validate a shared secret API key on every request:
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("Mock Interview RAG Server")
+
+# FastMCP auth middleware (check docs for current API)
+# Reject any request missing the correct Authorization header
+```
+
+- **The MCP spec** defines an `Authorization` header mechanism (`Bearer <token>`) that MCP clients know how to send — configure it in the client config's `headers` field:
+
+```json
+{
+  "mcpServers": {
+    "mock-interview": {
+      "url": "https://your-server:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer your-secret-token"
+      }
+    }
+  }
+}
+```
+
+- **Localhost is safe without auth** — if the server only listens on `127.0.0.1` (not `0.0.0.0`), it is inaccessible from other machines and auth is optional
