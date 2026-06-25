@@ -180,7 +180,8 @@ sequenceDiagram
     Client->>Docker: docker compose run --rm mcp-server
     Docker->>Container: start container, run server.py
     Container->>Container: initialize_rag() — embed all source files
-    Client<-->Container: MCP tool calls over stdio
+    Client->>Container: tool call (JSON-RPC request)
+    Container-->>Client: tool result (JSON-RPC response)
     Client->>Docker: session ends (stdin closes)
     Docker->>Container: container stops and is removed
 ```
